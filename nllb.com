@@ -13,6 +13,6 @@ python train_nllb_custom.py \
     --val_csv "data/si-en/dev.sien.df.short.tsv" \
     --src_lang "sin_Sinh" \
     --tgt_lang "eng_Latn" \
-    --batch_size 16 \
+    --batch_size 4 \
     --num_epochs 5 \
     --learning_rate 1e-5
