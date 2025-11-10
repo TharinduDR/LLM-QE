@@ -1,0 +1,5 @@
+datasets
+scipy
+numpy
+transformers
+OpenAI
