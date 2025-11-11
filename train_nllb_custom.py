@@ -311,12 +311,12 @@ def main():
     # Load datasets
     print("Loading datasets...")
     train_dataset = CustomQEDataset(
-        csv_path=args.train_csv,
+        tsv_path=args.train_csv,
         use_model_scores=args.use_model_scores
     )
 
     val_dataset = CustomQEDataset(
-        csv_path=args.val_csv,
+        tsv_path=args.val_csv,
         use_model_scores=args.use_model_scores
     )
 
