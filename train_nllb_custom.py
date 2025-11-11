@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Train NLLB-QE with pairwise contrastive/ranking loss.
+Train NLLB-QE with pairwise contrastive loss.
+Includes step-based evaluation.
 """
 
 import argparse
@@ -25,7 +26,7 @@ from utils.custom_data_utils import CustomQEDataset, collate_custom_nllb
 
 
 def evaluate(model, dataloader, device):
-    """Evaluate model."""
+    """Evaluate model on validation set."""
     model.eval()
     all_predictions = []
     all_targets = []
@@ -85,10 +86,13 @@ def train(
         margin: float = 0.5,
         mse_weight: float = 0.3,
         ranking_weight: float = 0.7,
-        hard_negative_mining: bool = False
+        hard_negative_mining: bool = False,
+        eval_steps: int = 200,  # NEW: Evaluate every N steps
+        save_steps: int = None,  # NEW: Save checkpoint every N steps (None = only save best)
+        max_eval_batches: int = None  # NEW: Limit eval batches for speed (None = all)
 ):
     """
-    Train with pairwise contrastive loss.
+    Train with step-based evaluation.
     """
     model = model.to(device)
 
@@ -161,35 +165,44 @@ def train(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Training loop
+    # Training state
     best_pearson = -1.0
+    best_step = 0
     global_step = 0
+    steps_per_epoch = len(train_loader) // gradient_accumulation_steps
 
     print(f"\n{'=' * 70}")
-    print(f"Starting Training with Pairwise Contrastive Loss")
+    print(f"Starting Training with Step-based Evaluation")
     print(f"{'=' * 70}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     print(f"Batch size: {batch_size}")
+    print(f"Gradient accumulation: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {batch_size * gradient_accumulation_steps}")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Total steps: {total_steps}")
+    print(f"Eval every: {eval_steps} steps")
+    if save_steps:
+        print(f"Save every: {save_steps} steps")
     print(f"Pairs per batch: ~{batch_size * (batch_size - 1) // 2}")
-    print(f"Epochs: {num_epochs}")
-    print(f"Learning rate: {learning_rate}")
     print(f"Device: {device}")
     print(f"{'=' * 70}\n")
 
+    # Track running averages for logging
+    running_loss = 0.0
+    running_stats = {}
+    running_count = 0
+
     for epoch in range(num_epochs):
         model.train()
-        train_loss = 0.0
-        train_stats = {
-            'pairwise_loss': 0.0,
-            'pairwise_accuracy': 0.0,
-            'mse': 0.0
-        }
-        num_batches = 0
+        epoch_loss = 0.0
 
-        optimizer.zero_grad()
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            total=len(train_loader)
+        )
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
         for batch_idx, batch in enumerate(pbar):
             # Move to device
             src_input = {k: v.to(device) for k, v in batch['source'].items()}
@@ -218,6 +231,13 @@ def train(
             # Backward
             loss.backward()
 
+            # Accumulate for logging
+            running_loss += loss.item() * gradient_accumulation_steps
+            running_count += 1
+            for key, value in stats.items():
+                running_stats[key] = running_stats.get(key, 0.0) + value
+
+            # Optimizer step
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -225,103 +245,162 @@ def train(
                 optimizer.zero_grad()
                 global_step += 1
 
-            train_loss += loss.item() * gradient_accumulation_steps
-
-            # Accumulate stats
-            for key in stats:
-                if key in train_stats:
-                    train_stats[key] += stats[key]
-            num_batches += 1
-
-            # Update progress bar
-            postfix = {
-                'loss': f"{loss.item() * gradient_accumulation_steps:.4f}",
-                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-            }
-            if 'pairwise_accuracy' in stats:
-                postfix['pair_acc'] = f"{stats['pairwise_accuracy']:.3f}"
-            if 'mse' in stats:
-                postfix['mse'] = f"{stats['mse']:.4f}"
-
-            pbar.set_postfix(postfix)
-
-            if log_wandb and global_step % 10 == 0:
-                log_dict = {
-                    'train/loss': loss.item() * gradient_accumulation_steps,
-                    'train/lr': scheduler.get_last_lr()[0],
-                    'train/step': global_step
+                # Update progress bar
+                postfix = {
+                    'step': global_step,
+                    'loss': f"{loss.item() * gradient_accumulation_steps:.4f}",
+                    'lr': f"{scheduler.get_last_lr()[0]:.2e}"
                 }
-                for key, value in stats.items():
-                    log_dict[f'train/{key}'] = value
-                wandb.log(log_dict)
+                if 'pairwise_accuracy' in stats:
+                    postfix['pair_acc'] = f"{stats['pairwise_accuracy']:.3f}"
+                pbar.set_postfix(postfix)
 
-        avg_train_loss = train_loss / len(train_loader)
+                # ============================================
+                # STEP-BASED EVALUATION
+                # ============================================
+                if global_step % eval_steps == 0:
+                    print(f"\n{'=' * 70}")
+                    print(f"Evaluation at Step {global_step} (Epoch {epoch + 1})")
+                    print(f"{'=' * 70}")
 
-        # Average stats
-        for key in train_stats:
-            train_stats[key] /= num_batches
+                    # Compute average training metrics
+                    avg_running_loss = running_loss / running_count
+                    avg_running_stats = {k: v / running_count for k, v in running_stats.items()}
 
-        # Evaluation
-        metrics = evaluate(model, val_loader, device)
+                    print(f"Train Loss (last {running_count} batches): {avg_running_loss:.4f}")
+                    if 'pairwise_accuracy' in avg_running_stats:
+                        print(f"Train Pair Accuracy: {avg_running_stats['pairwise_accuracy']:.4f}")
+                    if 'mse' in avg_running_stats:
+                        print(f"Train MSE: {avg_running_stats['mse']:.4f}")
 
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        print(f"Train Loss: {avg_train_loss:.4f}")
-        if 'pairwise_accuracy' in train_stats:
-            print(f"Train Pair Accuracy: {train_stats['pairwise_accuracy']:.4f}")
-        if 'mse' in train_stats:
-            print(f"Train MSE: {train_stats['mse']:.4f}")
-        print(f"Val Metrics:")
-        print(f"  Pearson:  {metrics['pearson']:.4f}")
-        print(f"  Spearman: {metrics['spearman']:.4f}")
-        print(f"  MAE:      {metrics['mae']:.4f}")
-        print(f"  RMSE:     {metrics['rmse']:.4f}")
+                    # Reset running averages
+                    running_loss = 0.0
+                    running_stats = {}
+                    running_count = 0
 
-        if log_wandb:
-            wandb.log({
-                'val/pearson': metrics['pearson'],
-                'val/spearman': metrics['spearman'],
-                'val/mae': metrics['mae'],
-                'val/rmse': metrics['rmse'],
-                'train/epoch_loss': avg_train_loss,
-                'epoch': epoch + 1
-            })
+                    # Evaluate on validation set
+                    if max_eval_batches:
+                        # Fast evaluation: only use subset
+                        print(f"Running fast evaluation ({max_eval_batches} batches)...")
+                        eval_loader_subset = list(val_loader)[:max_eval_batches]
 
-        # Save best model (based on Pearson)
-        if metrics['pearson'] > best_pearson:
-            best_pearson = metrics['pearson']
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'metrics': metrics,
-                'config': {
-                    'model_name': model.model_name,
-                    'embedding_dim': model.embedding_dim,
-                    'pooling': model.pooling,
-                    'src_lang': src_lang,
-                    'tgt_lang': tgt_lang,
-                    'loss_type': loss_type,
-                    'margin': margin
-                }
-            }, f"{output_dir}/best_model.pt")
-            print(f"✓ Saved best model (Pearson={best_pearson:.4f})")
+                        # Create temporary loader
+                        class ListDataLoader:
+                            def __init__(self, data):
+                                self.data = data
 
-        # Save checkpoint
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'metrics': metrics,
-        }, f"{output_dir}/checkpoint_epoch_{epoch + 1}.pt")
+                            def __iter__(self):
+                                return iter(self.data)
 
-    print(f"\nTraining complete!")
+                        metrics = evaluate(model, ListDataLoader(eval_loader_subset), device)
+                    else:
+                        # Full evaluation
+                        print("Running full evaluation...")
+                        metrics = evaluate(model, val_loader, device)
+
+                    print(f"Val Metrics:")
+                    print(f"  Pearson:  {metrics['pearson']:.4f}")
+                    print(f"  Spearman: {metrics['spearman']:.4f}")
+                    print(f"  MAE:      {metrics['mae']:.4f}")
+                    print(f"  RMSE:     {metrics['rmse']:.4f}")
+
+                    # Log to wandb
+                    if log_wandb:
+                        log_dict = {
+                            'val/pearson': metrics['pearson'],
+                            'val/spearman': metrics['spearman'],
+                            'val/mae': metrics['mae'],
+                            'val/rmse': metrics['rmse'],
+                            'train/avg_loss': avg_running_loss,
+                            'train/step': global_step,
+                            'train/epoch': epoch + (batch_idx / len(train_loader))
+                        }
+                        for key, value in avg_running_stats.items():
+                            log_dict[f'train/avg_{key}'] = value
+                        wandb.log(log_dict)
+
+                    # Save best model
+                    if metrics['pearson'] > best_pearson:
+                        best_pearson = metrics['pearson']
+                        best_step = global_step
+
+                        torch.save({
+                            'step': global_step,
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'metrics': metrics,
+                            'best_pearson': best_pearson,
+                            'config': {
+                                'model_name': model.model_name,
+                                'embedding_dim': model.embedding_dim,
+                                'pooling': model.pooling,
+                                'src_lang': src_lang,
+                                'tgt_lang': tgt_lang,
+                                'loss_type': loss_type,
+                                'margin': margin
+                            }
+                        }, f"{output_dir}/best_model.pt")
+
+                        print(f"✓ Saved best model (Pearson={best_pearson:.4f} at step {best_step})")
+
+                    print(f"{'=' * 70}\n")
+
+                    # Back to training mode
+                    model.train()
+
+                # ============================================
+                # STEP-BASED CHECKPOINTING
+                # ============================================
+                if save_steps and global_step % save_steps == 0:
+                    checkpoint_path = f"{output_dir}/checkpoint_step_{global_step}.pt"
+                    torch.save({
+                        'step': global_step,
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                    }, checkpoint_path)
+                    print(f"💾 Saved checkpoint at step {global_step}")
+
+                # Log training metrics every 10 steps
+                if log_wandb and global_step % 10 == 0:
+                    log_dict = {
+                        'train/loss': loss.item() * gradient_accumulation_steps,
+                        'train/lr': scheduler.get_last_lr()[0],
+                        'train/step': global_step
+                    }
+                    for key, value in stats.items():
+                        log_dict[f'train/{key}'] = value
+                    wandb.log(log_dict)
+
+            epoch_loss += loss.item() * gradient_accumulation_steps
+
+        # End of epoch summary
+        avg_epoch_loss = epoch_loss / len(train_loader)
+        print(f"\n{'=' * 70}")
+        print(f"End of Epoch {epoch + 1}/{num_epochs}")
+        print(f"Average Epoch Loss: {avg_epoch_loss:.4f}")
+        print(f"Steps completed: {global_step}/{total_steps}")
+        print(f"Best Pearson so far: {best_pearson:.4f} (at step {best_step})")
+        print(f"{'=' * 70}\n")
+
+    # Final summary
+    print(f"\n{'=' * 70}")
+    print(f"Training Complete!")
+    print(f"{'=' * 70}")
+    print(f"Total steps: {global_step}")
     print(f"Best Pearson: {best_pearson:.4f}")
+    print(f"Best step: {best_step}")
+    print(f"Best model saved to: {output_dir}/best_model.pt")
+    print(f"{'=' * 70}\n")
 
     return best_pearson
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train NLLB-QE with contrastive ranking loss")
+    parser = argparse.ArgumentParser(description="Train NLLB-QE with step-based evaluation")
 
     # Model arguments
     parser.add_argument(
@@ -352,6 +431,26 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+
+    # Evaluation arguments (NEW)
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=200,
+        help="Evaluate every N steps"
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=None,
+        help="Save checkpoint every N steps (default: only save best)"
+    )
+    parser.add_argument(
+        "--max_eval_batches",
+        type=int,
+        default=None,
+        help="Max batches for evaluation (None=all, use small number for fast eval)"
+    )
 
     # Loss arguments
     parser.add_argument(
@@ -443,7 +542,10 @@ def main():
         margin=args.margin,
         mse_weight=args.mse_weight,
         ranking_weight=args.ranking_weight,
-        hard_negative_mining=args.hard_negative_mining
+        hard_negative_mining=args.hard_negative_mining,
+        eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
+        max_eval_batches=args.max_eval_batches
     )
 
     print(f"\nFinal Best Pearson: {best_pearson:.4f}")
