@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=a5000-48h
-#SBATCH --mem=80G
+#SBATCH --mem=40G
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.ranasinghe@lancaster.ac.uk
 
