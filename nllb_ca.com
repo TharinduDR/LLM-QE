@@ -19,6 +19,6 @@ python train_cross_attention.py \
     --hard_negative_mining \
     --num_attention_heads 8 \
     --batch_size 16 \
-    --num_epochs 5 \
+    --num_epochs 10 \
     --eval_steps 200 \
-    --learning_rate 1e-5
+    --learning_rate 1e-6
